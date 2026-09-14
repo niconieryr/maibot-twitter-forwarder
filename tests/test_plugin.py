@@ -1148,6 +1148,103 @@ async def test_batch_forward(module, plugin, context) -> None:
     check(len(forwards) == 1 and len(forwards[0][2]) == 3, "轮询的 3 条推文合并成一条聊天记录")
 
 
+async def test_delivery_format(module, plugin, context) -> None:
+    """投递格式：自己轮询到的新推走普通图文，/tw_test 预览走合并转发。"""
+
+    print("\n[5f] 投递格式（轮询 vs /tw_test）")
+    now = time.time()
+
+    def make(tweet_id: str, text: str, *, images: int = 0, ts: float | None = None, video: bool = False):
+        if video:
+            media = [
+                module.TweetMedia(
+                    kind="video",
+                    url=f"https://video.twimg.com/{tweet_id}.mp4",
+                    thumbnail_url=f"https://pbs.twimg.com/thumb_{tweet_id}.jpg",
+                    duration=8.0,
+                    formats=[],
+                )
+            ]
+        else:
+            media = [
+                module.TweetMedia(kind="photo", url=f"https://pbs.twimg.com/media/{tweet_id}_{index}.jpg")
+                for index in range(images)
+            ]
+        return make_tweet(module, tweet_id, now if ts is None else ts, text=text, media=media)
+
+    # 0) 默认值
+    defaults = module.create_plugin().get_default_config()
+    check(defaults["display"]["forward_for_poll"] is False, "轮询默认「不用」合并转发")
+    check(defaults["display"]["forward_for_test"] is True, "/tw_test 默认「用」合并转发")
+    check(defaults["display"]["use_forward"] is True, "合并转发总开关仍默认开着")
+
+    # 1) 轮询路径：普通图文，最旧的先发（聊天里从上往下就是时间顺序）
+    plugin.config.display.forward_for_poll = False
+    plugin.config.display.forward_for_test = True
+    plugin.config.display.batch_forward = True
+    plugin.config.display.use_forward = True
+    batch = [make("5001", "旧推", ts=now - 300), make("5002", "新推", ts=now - 100)]
+    plugin._client = StubClient(batch, image_bytes=b"x" * 128)
+    context.send.reset()
+    delivered = await plugin._deliver_many(batch, "stream-a")
+    check(len(delivered) == 2, f"轮询格式两条都投递成功（实际 {len(delivered)}）")
+    check(not context.send.forwards(), "轮询格式不发合并转发")
+    texts = [call[2] for call in context.send.calls if call[0] == "text"]
+    check(len(texts) == 2, f"两条各发一条普通消息（实际 {len(texts)}）")
+    check("旧推" in texts[0] and "新推" in texts[1], "普通图文按时间顺序发（最旧的先发）")
+
+    # 2) 轮询路径的配图：逐张普通图片消息，不打包
+    plugin._client = StubClient([], image_bytes=b"y" * 256)
+    context.send.reset()
+    await plugin._deliver_many([make("5003", "带图推文", images=2)], "stream-a")
+    check(not context.send.forwards(), "轮询格式的配图不打包成聊天记录")
+    check(len([c for c in context.send.calls if c[0] == "image"]) == 2, "配图逐张发普通图片消息")
+
+    # 3) 轮询路径的视频：单独成条，不进聊天记录
+    video_tweet = make("5004", "视频推文", video=True)
+    plugin._client = StubClient(
+        [video_tweet],
+        head_sizes={"https://video.twimg.com/5004.mp4": 900 * 1024},
+        video_bytes=b"V" * 4096,
+    )
+    context.send.reset()
+    await plugin._deliver_many([video_tweet], "stream-a")
+    check(not context.send.forwards(), "轮询格式下视频不进聊天记录")
+    check(len(context.send.hybrids()) == 1, "视频单独成条（混合消息）")
+
+    # 4) /tw_test 预览：一条聊天记录，每条推文一个节点，最新在最上面
+    preview = [make("5101", "预览旧", ts=now - 300), make("5102", "预览新", ts=now - 100)]
+    plugin._client = StubClient(preview, image_bytes=b"x")
+    context.send.reset()
+    result = await plugin.handle_test(
+        stream_id="stream-a", matched_groups={"rest": "elonmusk 2"}, user_id="10001"
+    )
+    check(result[0] is True, "/tw_test 执行成功")
+    forwards = context.send.forwards()
+    check(len(forwards) == 1, f"/tw_test 发一条聊天记录（实际 {len(forwards)}）")
+    if forwards:
+        check(len(forwards[0][2]) == 2, "两条预览推文各占一个节点")
+        node_texts = context.send.node_texts(forwards[0])
+        check("预览新" in node_texts[0] and "预览旧" in node_texts[1], f"聊天记录里最新在最上面：{[t[:6] for t in node_texts]}")
+
+    # 5) 关掉 forward_for_test → 预览也走普通图文
+    plugin.config.display.forward_for_test = False
+    plugin._client = StubClient(preview, image_bytes=b"x")
+    context.send.reset()
+    await plugin.handle_test(stream_id="stream-a", matched_groups={"rest": "elonmusk 2"}, user_id="10001")
+    check(not context.send.forwards(), "关掉 forward_for_test 后预览不发聊天记录")
+
+    # 6) 总开关 use_forward=False 时，即使 forward_for_test=True 也不发聊天记录
+    plugin.config.display.forward_for_test = True
+    plugin.config.display.use_forward = False
+    plugin._client = StubClient(preview, image_bytes=b"x")
+    context.send.reset()
+    await plugin.handle_test(stream_id="stream-a", matched_groups={"rest": "elonmusk 2"}, user_id="10001")
+    check(not context.send.forwards(), "总开关关掉后任何路径都不发聊天记录")
+    plugin.config.display.use_forward = True
+    plugin.config.display.forward_for_poll = True  # 还原成其余用例依赖的值
+
+
 async def test_translation(module, plugin, context) -> None:
     """自动翻译：模型选择、替换原文、跳过条件、失败兜底、缓存。"""
 
@@ -1789,6 +1886,9 @@ async def main() -> int:
     plugin = module.create_plugin()
     config = plugin.get_default_config()
     config["poll"]["initial_delay_seconds"] = 3600  # 不让后台轮询干扰测试
+    # 老用例测的是「合并转发」那套机制本身，所以这里把轮询路径也打开转发；
+    # 新的默认行为（轮询走普通图文、/tw_test 走聊天记录）在 [5d] 里单独测。
+    config["display"]["forward_for_poll"] = True
     plugin.set_plugin_config(config)
     context = FakeContext(DATA_DIR)
     plugin._set_context(context)
@@ -1801,6 +1901,7 @@ async def main() -> int:
         await test_batch_forward(module, plugin, context)
         await test_translation(module, plugin, context)
         await test_link_preview(module, plugin, context)
+        await test_delivery_format(module, plugin, context)
         await test_url_safety_async(module, plugin, context)
         await test_commands(module, plugin, context)
     finally:

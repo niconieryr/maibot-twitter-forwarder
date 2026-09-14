@@ -239,7 +239,21 @@ class DisplaySection(PluginConfigBase):
     __ui_icon__ = "layout"
     __ui_order__ = 5
 
-    use_forward: bool = Field(default=True, description="true=图文打包成一条合并转发；false=先发文字再逐张发图")
+    use_forward: bool = Field(
+        default=True,
+        description="合并转发总开关：关掉之后任何路径都不会用合并转发，全部走普通图文",
+    )
+    forward_for_poll: bool = Field(
+        default=False,
+        description=(
+            "自己轮询到的新推文是否用合并转发（默认 false：按普通图文逐条发，"
+            "最旧的先发，聊天里从上往下就是时间顺序）"
+        ),
+    )
+    forward_for_test: bool = Field(
+        default=True,
+        description="/tw_test 预览是否用合并转发（默认 true：一条聊天记录里每条推文一个节点，最新在最上面）",
+    )
     batch_forward: bool = Field(
         default=True,
         description="一次有多个新推文时，合并成一条聊天记录（合并转发），每条推文占其中一个节点",
@@ -250,7 +264,7 @@ class DisplaySection(PluginConfigBase):
     )
     video_in_forward: bool = Field(
         default=True,
-        description="一次有多条推文时，把视频也放进它自己的聊天记录节点里（关掉则视频单独成条发）",
+        description="合并转发时，把视频也放进它自己的聊天记录节点里（关掉、或走普通图文时视频单独成条发）",
     )
     forward_nickname: str = Field(default="推特转发", description="合并转发节点里显示的昵称")
     show_author: bool = Field(default=True, description="是否显示作者与时间")
@@ -2282,8 +2296,18 @@ class TwitterForwarderPlugin(MaiBotPlugin):
 
     # -- 投递 -------------------------------------------------------------
 
-    async def _broadcast_many(self, tweets: list[Tweet], handle: str) -> list[Tweet]:
+    async def _broadcast_many(
+        self,
+        tweets: list[Tweet],
+        handle: str,
+        *,
+        use_forward: Optional[bool] = None,
+    ) -> list[Tweet]:
         """把一批新推文推送给订阅该推主的所有聊天流。
+
+        Args:
+            use_forward: 是否用合并转发格式；``None`` 表示按 ``display.forward_for_poll``
+                （默认普通图文，只有 ``/tw_test`` 预览才打包成聊天记录）。
 
         Returns:
             list[Tweet]: 至少成功送达一个聊天流的推文列表。
@@ -2304,7 +2328,7 @@ class TwitterForwarderPlugin(MaiBotPlugin):
         delivered: dict[str, Tweet] = {}
         for stream_id in targets:
             try:
-                for tweet in await self._deliver_many(tweets, stream_id, images_map):
+                for tweet in await self._deliver_many(tweets, stream_id, images_map, use_forward=use_forward):
                     delivered[tweet.id] = tweet
             except Exception as exc:
                 self._get_logger().error(
@@ -2990,23 +3014,43 @@ class TwitterForwarderPlugin(MaiBotPlugin):
         except Exception as exc:  # pragma: no cover - 防御性兜底
             self._get_logger().warning("批量翻译异常，相关推文保留原文: %s", exc)
 
-    async def _deliver(self, tweet: Tweet, stream_id: str, images: Optional[list[bytes]] = None) -> bool:
+    async def _deliver(
+        self,
+        tweet: Tweet,
+        stream_id: str,
+        images: Optional[list[bytes]] = None,
+        *,
+        use_forward: Optional[bool] = None,
+    ) -> bool:
         """把一条推文发送到指定聊天流（单条的便捷入口，内部走批量逻辑）。"""
 
-        return bool(await self._deliver_many([tweet], stream_id, {tweet.id: images} if images is not None else None))
+        return bool(
+            await self._deliver_many(
+                [tweet],
+                stream_id,
+                {tweet.id: images} if images is not None else None,
+                use_forward=use_forward,
+            )
+        )
 
     async def _deliver_many(
         self,
         tweets: list[Tweet],
         stream_id: str,
         images_map: Optional[dict[str, list[bytes]]] = None,
+        *,
+        use_forward: Optional[bool] = None,
     ) -> list[Tweet]:
         """把一批推文投递到一个聊天流，返回真正送出去的推文列表。
 
         排版规则：
-        * 一律打包成「聊天记录」（合并转发），**每条推文占其中一个节点**，
-          **最新的推文排在最上面**（单条推文同样走聊天记录）；
-        * 视频默认放进它自己的节点（`display.video_in_forward`），关掉则视频单独成条；
+        * ``use_forward=True``：打包成「聊天记录」（合并转发），**每条推文占其中一个节点**，
+          **最新的推文排在最上面**；``/tw_test`` 预览默认走这个格式（``display.forward_for_test``）。
+        * ``use_forward=False``：逐条普通图文（最新的一条先发，聊天里从上往下就是时间顺序）；
+          自己轮询到的新推默认走这个格式（``display.forward_for_poll``）。
+        * ``use_forward=None`` 时按上面那个 ``forward_for_poll`` 决定。
+        * 打包格式下视频默认放进它自己的节点（`display.video_in_forward`），
+          普通图文格式下视频单独成条发送；
         * 图片/视频总体积超过 `batch_max_mb` 或节点数超过上限时，自动拆成多条聊天记录；
         * 打包失败则逐条回退成普通图文，绝不因为格式问题丢推文。
         """
@@ -3024,8 +3068,10 @@ class TwitterForwarderPlugin(MaiBotPlugin):
         video_mode = str(self.config.media.video_mode or "auto").strip().lower()
         batch_budget = max(1.0, float(self.config.display.batch_max_mb or 7.0)) * 1024 * 1024
         video_tweets = [tweet for tweet in tweets if tweet.has_video and video_mode == "auto"]
-        # 关掉合并转发格式时不做"视频进节点"，让视频走单独成条
-        use_forward_format = bool(self.config.display.use_forward)
+        # use_forward=True 才用合并转发；None 表示"轮询到的新推"这一路，看配置
+        if use_forward is None:
+            use_forward = bool(self.config.display.forward_for_poll)
+        use_forward_format = bool(self.config.display.use_forward) and bool(use_forward)
 
         if video_tweets and bool(self.config.display.video_in_forward) and use_forward_format:
             # 视频塞进各自的聊天记录节点：预算按队列依次扣减
@@ -3061,18 +3107,19 @@ class TwitterForwarderPlugin(MaiBotPlugin):
                         self._get_logger().warning("视频投递异常，改为聊天记录里的封面: %s", exc)
                 pending.append(tweet)
 
-        # 最新的排在最上面
-        pending.sort(key=lambda item: item.created_ts, reverse=True)
+        # 合并转发：最新的排在最上面（聊天记录第一屏就是新推）
+        # 普通图文：最旧的先发（聊天里从上往下读就是时间顺序）
+        pending.sort(key=lambda item: item.created_ts, reverse=use_forward_format)
 
         try:
             if not pending:
                 return delivered
 
-            # 关掉批量或关掉合并转发格式时，逐条发
+            # 关掉批量或不用合并转发格式时，逐条发
             if not bool(self.config.display.batch_forward) or not use_forward_format:
                 for tweet in pending:
                     images = [] if tweet.id in video_payloads else (images_map or {}).get(tweet.id)
-                    if await self._deliver_plain(tweet, stream_id, images):
+                    if await self._deliver_plain(tweet, stream_id, images, use_forward=use_forward_format):
                         delivered.append(tweet)
                 return delivered
 
@@ -3102,7 +3149,9 @@ class TwitterForwarderPlugin(MaiBotPlugin):
                             ):
                                 delivered.append(item)
                             continue
-                        if await self._deliver_plain(item, stream_id, batch_images.get(item.id)):
+                        if await self._deliver_plain(
+                            item, stream_id, batch_images.get(item.id), use_forward=use_forward_format
+                        ):
                             delivered.append(item)
                 chunk = []
                 chunk_images = {}
@@ -3196,14 +3245,21 @@ class TwitterForwarderPlugin(MaiBotPlugin):
         tweet: Tweet,
         stream_id: str,
         images: Optional[list[bytes]] = None,
+        *,
+        use_forward: bool = True,
     ) -> bool:
-        """只用「文字 + 配图」发送一条推文，不尝试视频。"""
+        """只用「文字 + 配图」发送一条推文，不尝试视频。
+
+        Args:
+            use_forward: 有配图时是否尝试打包成一条只有本推文的聊天记录。
+                轮询路径传 ``False``（就是普通图文），``/tw_test`` 预览传 ``True``。
+        """
 
         if images is None:
             images = await self._collect_images(tweet)
         text = self._render_tweet(tweet, images)
 
-        if images and self.config.display.use_forward:
+        if images and use_forward and self.config.display.use_forward:
             if await self._send_forward_nodes([tweet], stream_id, {tweet.id: images}):
                 return True
             self._get_logger().warning("合并转发失败，回退为普通图文发送: stream=%s", stream_id)
@@ -3780,15 +3836,28 @@ class TwitterForwarderPlugin(MaiBotPlugin):
             except ValueError:
                 count = 1
 
-        pushed = await self._push_latest(handle, stream_id, count=count)
+        pushed = await self._push_latest(
+            handle, stream_id, count=count, use_forward=bool(self.config.display.forward_for_test)
+        )
         if pushed:
             await self._reply(stream_id, f"✅ 已推送 @{handle} 的最新 {pushed} 条推文（不计入订阅状态）。")
         else:
             await self._reply(stream_id, f"没能取到 @{handle} 的推文，检查用户名、网络或代理设置。")
         return True, "测试推送完成", True
 
-    async def _push_latest(self, handle: str, stream_id: str, *, count: int = 1) -> int:
+    async def _push_latest(
+        self,
+        handle: str,
+        stream_id: str,
+        *,
+        count: int = 1,
+        use_forward: Optional[bool] = None,
+    ) -> int:
         """拉取指定推主的最新推文并推送到聊天流，不修改订阅状态。
+
+        Args:
+            use_forward: 是否用合并转发格式；``/tw_test`` 预览传 ``display.forward_for_test``，
+                订阅时的"推最新一条"留 ``None``（跟随轮询那套，默认普通图文）。
 
         Returns:
             int: 实际推送成功的条数。
@@ -3806,12 +3875,12 @@ class TwitterForwarderPlugin(MaiBotPlugin):
 
         accepted = [item for item in tweets if self._accept_tweet(item)]
         accepted.sort(key=lambda item: item.created_ts, reverse=True)
-        # 取最新的 count 条，按时间正序打包成一条聊天记录
+        # 取最新的 count 条，按时间正序摆放（合并转发时 _deliver_many 会再按格式排序）
         selected = list(reversed(accepted[: max(1, count)]))
         if not selected:
             return 0
         try:
-            return len(await self._deliver_many(selected, target))
+            return len(await self._deliver_many(selected, target, use_forward=use_forward))
         except Exception as exc:
             self._get_logger().error("预览推文发送失败: %s", exc, exc_info=True)
             return 0
