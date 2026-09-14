@@ -10,7 +10,7 @@
 [![version](https://img.shields.io/badge/version-1.6.2-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-GPL--3.0--or--later-orange)](LICENSE)
 
-[功能特性](#-功能特性) · [安装](#-安装) · [命令](#-斜杠命令) · [配置](#%EF%B8%8F-配置说明) · [常见问题](#-常见问题) · [更新日志](CHANGELOG.md)
+[功能特性](#-功能特性) · [安装](#-安装) · [命令](#-斜杠命令) · [配置](#%EF%B8%8F-配置说明) · [安全](#-安全说明) · [常见问题](#-常见问题) · [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -42,6 +42,8 @@
 - **LLM 工具**：注册了只读工具 `twitter_latest(handle, count)`，AI 可以直接查"某某最近发了什么"。
 - **分层回退**：视频失败 → 封面 + 链接；合并转发失败 → 逐条图文；翻译失败 → 保留原文。
   **绝不因为格式或网络问题丢推文。**
+- **默认收紧的安全边界**：跨聊天命令默认仅管理员、链接抓取默认拦截内网地址（防 SSRF）、
+  默认跳过被标记为敏感的推文。详见[安全说明](#-安全说明)。
 
 ## 📦 安装
 
@@ -51,7 +53,8 @@
 | --- | --- |
 | MaiBot（MaiCore） | `1.2.0` ~ `1.2.x` |
 | 插件 SDK | `maibot_sdk >= 2.5.0`（随 MaiBot 提供） |
-| Python 依赖 | `aiohttp`（MaiBot 自带） |
+| Python 依赖 | 仅 `aiohttp`（MaiBot 自带），**无第三方包依赖** |
+| 可选增强 | `trafilatura` / `beautifulsoup4` / `readability-lxml`（装了链接正文提取更干净，不装也能跑） |
 | HTTP 代理 | 下载推文图片/视频用，例如 `http://127.0.0.1:7890`（Clash / mihomo） |
 
 ### 步骤
@@ -64,8 +67,12 @@
    ```
 
    > 目录名不重要，插件身份由 `_manifest.json` 里的 `id` 决定。
+   >
+   > **仓库里没有 `config.toml`**：插件首次加载时，Runner 会根据插件内置的
+   > `config_model` 自动生成这个文件（带中文注释和默认值），所以不要把实例配置提交回仓库，
+   > 免得以后 `git pull` 撞冲突。
 
-2. 确认 `config.toml` 里 `[plugin] enabled = true`，并检查 `[twitter] proxy`
+2. 确认生成出来的 `config.toml` 里 `[plugin] enabled = true`，并检查 `[twitter] proxy`
    指向本机可用的代理——**接口本身可以直连，但图片和视频在 `pbs.twimg.com` / `video.twimg.com`，
    不走代理就只能发文字**。
 
@@ -73,7 +80,12 @@
 
    ```text
    推特转发插件已启动：订阅 0 个推主，轮询间隔 10 分钟，代理=http://127.0.0.1:7890，视频模式=auto
+   链接正文提取器：trafilatura/bs4/readability
    ```
+
+   > 如果第二行显示 `链接正文提取器：无`，说明可选增强没装，插件仍能正常工作，
+   > 只是正文提取会退化成正则清洗 + `og:description`。想装：
+   > `uv pip install trafilatura beautifulsoup4 readability-lxml`（注意别装进系统 Python）。
 
 4. 在群里订阅一个推主：
 
@@ -83,32 +95,47 @@
 
    订阅成功后会把该推主最新一条推文推过来（可用 `push.push_latest_on_subscribe` 关掉）。
 
-5. **（可选，想收大视频必做）** 把 QQ 适配器的动作超时调大，见
+5. **（重要）配置管理员**：跨聊天命令（`/tw_all`、`/tw_del`、`/tw_reset`、`/tw_check`、
+   `/tw_interval`）默认**只有管理员和本地操作员**能用，见[安全说明](#-安全说明)。
+   想让自己的 QQ 能用，把它们填进 `command.admins`：
+
+   ```toml
+   [command]
+   cross_chat_admin_only = true
+   admins = ["123456789"]
+   ```
+
+6. **（可选，想收大视频必做）** 把 QQ 适配器的动作超时调大，见
    [视频怎么发 · 关键：把适配器的 action 超时调大](#关键把适配器的-action-超时调大大视频必做)。
 
 ## 💬 斜杠命令
 
-| 命令 | 说明 |
-| --- | --- |
-| `/tw_sub <用户名…>` | 订阅推主到当前聊天，支持 `@名字`、`https://x.com/名字`、推文链接 |
-| `/tw_unsub <用户名…>` | 取消当前聊天对该推主的订阅 |
-| `/tw_list` | 查看当前聊天的订阅 |
-| `/tw_all` | 查看全部订阅、推送目标与最近错误 |
-| `/tw_on` / `/tw_off` | 恢复 / 暂停当前聊天的推送（订阅关系保留） |
-| `/tw_check [用户名]` | 立刻检查一次，不带参数表示检查全部订阅 |
-| `/tw_test <用户名> [条数]` | 把最新推文立刻推过来预览，不影响订阅状态 |
-| `/tw_interval [分钟\|reset]` | 查看 / 设置轮询间隔，`reset` 恢复配置文件里的值 |
-| `/tw_reset <用户名>` | 重建基线，下次轮询不补推历史 |
-| `/tw_del <用户名>` | 彻底删除该推主在所有聊天的订阅 |
-| `/tw_status` | 查看运行状态（订阅数、上次轮询、数据源、代理） |
-| `/tw_help` / `/tw` | 显示帮助 |
+带 🔒 的命令会查看或修改**全局订阅 / 轮询状态**，默认只有管理员与本地操作员能用
+（`command.cross_chat_admin_only`）；其余命令只影响当前聊天。
+
+| 命令 | 范围 | 说明 |
+| --- | --- | --- |
+| `/tw_sub <用户名…>` | 当前聊天 | 订阅推主到当前聊天，支持 `@名字`、`https://x.com/名字`、推文链接 |
+| `/tw_unsub <用户名…>` | 当前聊天 | 取消当前聊天对该推主的订阅 |
+| `/tw_list` | 当前聊天 | 查看当前聊天的订阅 |
+| `/tw_on` / `/tw_off` | 当前聊天 | 恢复 / 暂停当前聊天的推送（订阅关系保留） |
+| `/tw_test <用户名> [条数]` | 当前聊天 | 把最新推文立刻推过来预览，不影响订阅状态 |
+| `/tw_status` | 只读 | 查看运行状态（订阅数、上次轮询、数据源、代理） |
+| `/tw_help` / `/tw` | 只读 | 显示帮助 |
+| 🔒 `/tw_all` | 全局 | 查看**所有聊天**的订阅、推送目标与最近错误 |
+| 🔒 `/tw_check [用户名]` | 全局 | 立刻检查一次，不带参数表示检查全部订阅 |
+| 🔒 `/tw_interval [分钟\|reset]` | 全局 | 查看 / 设置轮询间隔，`reset` 恢复配置文件里的值 |
+| 🔒 `/tw_reset <用户名>` | 全局 | 重建基线，下次轮询不补推历史（影响所有订阅它的聊天） |
+| 🔒 `/tw_del <用户名>` | 全局 | 彻底删除该推主在**所有聊天**的订阅 |
 
 半角 `/` 和全角 `／` 都可以，命令前带不带 `@机器人` 都能识别。
 用户名打错时会提示最接近的真实账号（例如 `limbus_company_b` 超长 → 提示 `LimbusCompany_B`）。
+非管理员调用 🔒 命令时会得到明确提示：`这条命令会影响所有聊天的订阅或全局轮询状态…`。
 
 ## ⚙️ 配置说明
 
-配置写在 `config.toml`，也可以在 WebUI 的插件配置页里改。
+`config.toml` 由 Runner 在首次加载时**根据插件内置的 config_model 自动生成**（带中文注释），
+也可以在 WebUI 的插件配置页里改；**这个文件属于实例配置，不要提交回仓库**（本仓库里没有它）。
 聊天命令产生的改动保存在 `state.json`，**优先级高于 `config.toml`**，
 用 `/tw_interval reset` 之类可以回到配置文件的值。
 
@@ -123,6 +150,7 @@
 | `push.extra_streams` | `[]` | 额外固定推送目标（聊天流 session_id） |
 | `push.include_reposts` | `true` | 是否推送转推 |
 | `push.include_replies` | `false` | 是否推送回复 |
+| `push.skip_sensitive` | **`true`** | 是否跳过被接口标记为「可能敏感」的推文（默认跳过） |
 | `media.video_mode` | `auto` | `auto` / `thumbnail` / `link` |
 | `media.inline_video_mb` | `10.0` | 内联 base64 直发的视频上限（别超过 11） |
 | `media.max_video_mb` | `300.0` | 视频下载上限，超过就回退封面 + 链接 |
@@ -138,6 +166,10 @@
 | `translation.target_lang` | `简体中文` | 翻译目标语言 |
 | `link.enabled` | `true` | 是否抓取链接正文 |
 | `link.max_chars` | `3000` | 链接正文长度上限（0 = 不限） |
+| `link.allow_private_hosts` | **`false`** | 是否允许抓取指向本机/内网的链接（SSRF 防护开关） |
+| `command.cross_chat_admin_only` | **`true`** | 跨聊天命令是否仅管理员可用 |
+| `command.admin_only` | `false` | 是否所有命令都仅管理员可用 |
+| `command.admins` | `[]` | 管理员 QQ 号列表 |
 | `command.admin_only` | `false` | 是否限制命令使用者 |
 | `command.admins` | `[]` | 管理员 QQ 号 |
 
@@ -155,12 +187,57 @@
 | `[media]` | 图片开关/张数/尺寸/大小/超时，视频模式/内联上限/下载上限/超时/docker 借道/保留时长 |
 | `[display]` | 合并转发、批量打包、聊天记录体积上限、视频进节点、昵称、作者行、分隔线、链接与统计、正文截断 |
 | `[translation]` | 翻译开关、模型任务、目标语言、引用翻译、跳过条件、长度上限、并发、超时、提示词 |
-| `[link]` | 链接正文开关、展开条数、长度上限、分段翻译字数、超时、页面大小、代理、是否翻译、Steam 语言 |
-| `[command]` | 是否仅管理员可用、管理员列表 |
+| `[link]` | 链接正文开关、展开条数、长度上限、分段翻译字数、超时、页面大小、代理、是否翻译、Steam 语言、**SSRF 私网开关** |
+| `[command]` | 是否所有命令仅管理员、**跨聊天命令是否仅管理员**、管理员列表 |
 
-每个字段在 `config.toml` 里都有中文注释，直接看文件即可。
+每个字段在生成的 `config.toml` 里都有中文注释，直接看文件即可。
 
 </details>
+
+## 🔐 安全说明
+
+### 1. 命令权限：跨聊天操作默认收紧
+
+`/tw_all`、`/tw_del`、`/tw_reset`、`/tw_check`、`/tw_interval` 会**看到或改到别的聊天**，
+默认由 `command.cross_chat_admin_only = true` 限制为**仅管理员与本地操作员**：
+
+```toml
+[command]
+cross_chat_admin_only = true
+admins = ["你的QQ号"]
+```
+
+- **本地操作员**指 MaiBot 控制台 / WebUI 发来的指令（平台为 `bot_console`），始终放行。
+- 只影响当前聊天的命令（`/tw_sub`、`/tw_unsub`、`/tw_list`、`/tw_on|off`、`/tw_test`）
+  不受此限制。
+- 想恢复"谁都能用"的老行为，把 `cross_chat_admin_only` 设成 `false`，
+  或用更粗的 `command.admin_only = true` 把**所有**命令都锁给管理员。
+
+### 2. 链接预览的 SSRF 防护
+
+推文正文是**别人写的内容**，里面的链接可能指向 `http://127.0.0.1:xxxx`、
+`http://192.168.x.x`、`http://169.254.169.254`（云 metadata）、`http://100.64.x.x`（CGNAT / Tailscale）
+这类地址；插件会把抓到的正文发进群，等于给了外部一个读内网的通道。因此：
+
+- 抓取前先做校验：协议必须是 `http(s)`；主机名不能是 `localhost` / `*.local` / `*.internal`
+  这类名字；域名会**解析成 IP 逐个检查**，只要有一个不是公网地址（`not is_global`）就整条丢弃。
+- **每次跳转都重新校验**：手动跟随 3xx（最多 5 跳），避免"公网域名 302 到内网"绕过。
+- 被拦下的链接只写一条日志（`链接内容跳过（SSRF 防护）: …`），推文照常推送，只是不带链接内容块。
+- 需要抓内网链接（例如自建 Wiki）时显式打开 `link.allow_private_hosts = true`。
+
+> 已知边界：校验在 DNS 解析后进行，理论上存在 DNS rebinding（解析时公网、连接时内网）的窗口；
+> 对"把内容转发进聊天"这种低带宽场景，收益远小于风险，所以按主流做法先做解析校验。
+> 图片 / 视频的下载地址由 FxTwitter 接口给出（`pbs.twimg.com` / `video.twimg.com`），不受推文内容控制。
+
+### 3. 敏感内容默认不转发
+
+`push.skip_sensitive = true`（默认）会跳过被接口标记为 `possibly_sensitive` 的推文，
+避免群里突然出现不宜内容。确实想全都要，再改成 `false`。
+
+### 4. 其他
+
+- 抓取链接正文时的页面下载上限 `link.max_page_mb`（默认 2MB）、超时 `link.timeout_seconds`（默认 15s）。
+- 翻译 / 链接抓取失败都只降级、不中断投递，不会因为外部内容把推文卡住。
 
 ## 🧭 行为说明
 
@@ -316,9 +393,10 @@ Ubuntu 上用 snap 装的 docker，命令只在 `/snap/bin/docker`，而 **syste
 | 视频只来了封面 | 先看启动日志那行 `视频大文件通道就绪：docker=…`：若为 `找不到 docker 可执行文件（PATH=…）`，见「找不到 docker 命令怎么办」；其次看 `视频没能随推文发出` 上一行写的原因（超 `max_video_mb` / 下载失败 / 拷贝失败） |
 | 视频下载了但发不出去 | 日志里若有 `聊天记录发送失败` + 适配器的 `SnowLuma action 等待响应超时: action=send_private_forward_msg`，就是适配器 10 秒超时被大视频上传撞穿了，见「关键：把适配器的 action 超时调大」 |
 | 一直提示拉取失败 | 看 `logs/app_*.log.jsonl` 里 `plugin.polarbear.twitter-forwarder` 的记录；私密账号会一直失败，属正常 |
-| 命令没反应 | 确认插件已加载（`/tw_status`），以及 `command.admin_only` 是否把你自己挡在外面 |
+| 命令没反应 | 确认插件已加载（`/tw_status`）。若是 🔒 跨聊天命令，检查 `command.cross_chat_admin_only` 与 `command.admins`，或 `command.admin_only` 是否把你自己挡在外面 |
 | 想调整推送内容 | 改 `[display]` 段：作者行、链接、互动数据、正文截断长度都可以单独关 |
 | 一次收到太多条 | 调小 `poll.max_tweets_per_poll`，或调大 `poll.interval_minutes` |
+| 链接内容块不出现 | 先看日志有没有 `链接内容跳过（SSRF 防护）`：目标是内网地址时会被主动丢弃（见[安全说明](#-安全说明)）；没有这条日志则多半是页面抓不到正文 |
 
 ## 🛠 开发与自测
 
@@ -327,7 +405,7 @@ Ubuntu 上用 snap 装的 docker，命令只在 `/snap/bin/docker`，而 **syste
 ```bash
 cd plugins/<插件目录>/tests
 
-# 331 项检查：解析、命令正则、轮询去重、投递回退、视频路由、翻译、链接、权限
+# 389 项检查：解析、命令正则、轮询去重、投递回退、视频路由、翻译、链接、权限、SSRF
 ~/maimai/MaiBot/.venv/bin/python test_plugin.py
 
 # 真实网络预览：看一条推文会被渲染成什么样
@@ -340,13 +418,20 @@ cd plugins/<插件目录>/tests
 `test_plugin.py` 会真的请求 FxTwitter 并下载图片，需要一个可用代理；
 `check_docker_route.py` 需要 docker 权限。
 
+> 可选增强（`trafilatura` / `beautifulsoup4` / `readability-lxml`）不在 `_manifest.json`
+> 的 `dependencies` 里，也不在主程序依赖基线中：它们**只影响链接正文的抽取质量**，
+> 缺失时插件会退化成正则清洗 + `og:description`，不会因此加载失败——
+> 这也避免了在别人机器上因为装不上重依赖而把插件整个卡住。
+> 想启用就手动装到 MaiBot 的 venv：
+> `~/maimai/MaiBot/.venv/bin/python -m pip install trafilatura beautifulsoup4 readability-lxml`，
+> 启动日志的 `链接正文提取器：…` 会显示实际可用的提取器。
+
 ### 目录结构
 
 ```text
 .
 ├── _manifest.json      # 插件元信息（manifest v2）
 ├── plugin.py           # 插件主体（单文件）
-├── config.toml         # 配置模板（首次加载由 Runner 生成实例配置）
 ├── CHANGELOG.md        # 更新日志
 ├── LICENSE             # GPL-3.0-or-later
 └── tests/
@@ -354,6 +439,8 @@ cd plugins/<插件目录>/tests
     ├── preview.py            # 渲染预览
     └── check_docker_route.py # 视频容器借道真机验证
 ```
+
+> `config.toml` / `state.json` 都是**实例文件**，由 Runner 生成和维护，不在本仓库里。
 
 ## 📄 更新日志
 

@@ -23,6 +23,8 @@ import base64
 import contextlib
 import difflib
 import html as html_module
+import importlib.util
+import ipaddress
 import json
 import logging
 import os
@@ -30,13 +32,14 @@ import random
 import re
 import shlex
 import shutil
+import socket
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 try:  # aiohttp 由宿主环境提供；缺失时插件降级为不可用而不是加载失败
     import aiohttp
@@ -58,6 +61,27 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def available_extractors() -> list[str]:
+    """当前环境里可用的「链接正文提取器」。
+
+    ``trafilatura`` / ``bs4`` / ``readability`` 都是**可选增强**，不在宿主依赖基线里，
+    manifest 也不声明它们（避免装不上时把插件一起卡住）。三个都缺时仍然能跑：
+    提取会退化成正则清洗 + ``og:description``，Steam 公告走 RSS 不受影响。
+    """
+
+    names: list[str] = []
+    if trafilatura is not None:
+        names.append("trafilatura")
+    if BeautifulSoup is not None:
+        names.append("bs4")
+    try:
+        if importlib.util.find_spec("readability") is not None:
+            names.append("readability")
+    except (ImportError, ValueError):  # pragma: no cover - 环境异常时忽略
+        pass
+    return names
 
 PLUGIN_ID = "polarbear.twitter-forwarder"
 USER_AGENT = "MaiBot-TwitterForwarder/1.0 (+https://github.com/MaiM-with-u/maibot)"
@@ -165,7 +189,10 @@ class PushSection(PluginConfigBase):
     include_reposts: bool = Field(default=True, description="是否推送转推（博主转发别人的推文）")
     include_replies: bool = Field(default=False, description="是否推送回复（博主回复别人）")
     push_latest_on_subscribe: bool = Field(default=True, description="新增订阅时立刻把该推主最新一条推过来")
-    skip_sensitive: bool = Field(default=False, description="是否跳过被标记为可能敏感的推文")
+    skip_sensitive: bool = Field(
+        default=True,
+        description="是否跳过被接口标记为「可能敏感」的推文（默认跳过，避免群里出现不宜内容）",
+    )
 
 
 class MediaSection(PluginConfigBase):
@@ -292,6 +319,13 @@ class LinkSection(PluginConfigBase):
     max_page_mb: float = Field(default=2.0, description="页面下载大小上限（MB）")
     proxy: str = Field(default="", description="抓取用的 HTTP 代理；留空表示直连（失败会自动改用 twitter.proxy 重试）")
     fallback_proxy: bool = Field(default=True, description="直连抓不到时，用 [twitter] 的代理再试一次")
+    allow_private_hosts: bool = Field(
+        default=False,
+        description=(
+            "是否允许抓取指向本机/内网的链接（SSRF 防护开关）。默认关闭："
+            "推文里的外链如果解析到 127.0.0.1、10.x、192.168.x、169.254.x 等地址会被直接丢弃"
+        ),
+    )
     translate: bool = Field(default=True, description="抓到的正文是否也翻译（复用 [translation] 的目标语言）")
     link_language: str = Field(
         default="schinese",
@@ -306,7 +340,14 @@ class CommandSection(PluginConfigBase):
     __ui_icon__ = "terminal"
     __ui_order__ = 6
 
-    admin_only: bool = Field(default=False, description="true 时只有管理员能使用命令")
+    admin_only: bool = Field(default=False, description="true 时所有命令都只有管理员能使用")
+    cross_chat_admin_only: bool = Field(
+        default=True,
+        description=(
+            "跨聊天命令是否只允许管理员/本地操作员："
+            "/tw_all、/tw_del、/tw_reset、/tw_check、/tw_interval。默认开启"
+        ),
+    )
     admins: list[str] = Field(
         default_factory=list,
         description='管理员 QQ 号列表，例如 ["123456789"]；机器人的本地操作员始终放行',
@@ -1326,11 +1367,16 @@ class FxTwitterClient:
         proxy: Optional[str] = None,
         timeout: float = 25.0,
         max_bytes: int = 2 * 1024 * 1024,
+        validate: Optional[Any] = None,
+        max_redirects: int = 5,
     ) -> str:
         """抓取网页文本（自动跟随跳转）；失败或类型不对返回空串。
 
         Args:
             proxy: 显式指定代理地址；``None`` 时按 ``use_proxy`` 决定是否用会话代理。
+            validate: 可选的 ``async (url) -> (是否允许, 原因)`` 校验函数。
+                传入时会**关闭自动跳转并逐跳校验**，用于抓取不可信的外链（防 SSRF）。
+            max_redirects: 手动跟随跳转的最大次数。
         """
 
         if aiohttp is None or not url:
@@ -1338,28 +1384,47 @@ class FxTwitterClient:
         session = await self._ensure_session()
         resolved_proxy = proxy if proxy is not None else (self.proxy if use_proxy else None)
         request_timeout = aiohttp.ClientTimeout(total=max(5.0, float(timeout)))
+        headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+        target = str(url)
+
         try:
-            async with session.get(
-                url,
-                proxy=resolved_proxy,
-                timeout=request_timeout,
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-            ) as response:
-                if response.status != 200:
-                    return ""
-                content_type = str(response.headers.get("Content-Type") or "").lower()
-                if content_type and not any(
-                    marker in content_type for marker in ("text/html", "text/plain", "xml", "json")
-                ):
-                    return ""
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    total += len(chunk)
-                    if total > max_bytes:
-                        break
-                    chunks.append(chunk)
-                payload = b"".join(chunks)
+            for _ in range(max(1, max_redirects + 1)):
+                if validate is not None:
+                    allowed, reason = await validate(target)
+                    if not allowed:
+                        logger.warning("拒绝抓取不安全的链接（SSRF 防护）: %s → %s", target, reason)
+                        return ""
+                async with session.get(
+                    target,
+                    proxy=resolved_proxy,
+                    timeout=request_timeout,
+                    headers=headers,
+                    allow_redirects=validate is None,
+                ) as response:
+                    if validate is not None and response.status in (301, 302, 303, 307, 308):
+                        location = str(response.headers.get("Location") or "").strip()
+                        if not location:
+                            return ""
+                        target = urljoin(target, location)
+                        continue
+                    if response.status != 200:
+                        return ""
+                    content_type = str(response.headers.get("Content-Type") or "").lower()
+                    if content_type and not any(
+                        marker in content_type for marker in ("text/html", "text/plain", "xml", "json")
+                    ):
+                        return ""
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            break
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
+                break
+            else:
+                return ""
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
             return ""
         if not payload:
@@ -1584,6 +1649,108 @@ def find_docker(*, refresh: bool = False) -> Optional[str]:
     return found
 
 
+# --- 出站 URL 安全（SSRF 防护） -------------------------------------------
+
+#: 这些域名后缀一定指向本机 / 内网，直接拒绝
+BLOCKED_HOST_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".localdomain",
+    ".internal",
+    ".intranet",
+    ".lan",
+    ".home.arpa",
+    ".in-addr.arpa",
+)
+
+#: 允许抓取的协议
+ALLOWED_URL_SCHEMES = ("http", "https")
+
+
+def ip_is_blocked(ip: Any) -> bool:
+    """判断一个 IP 是否属于本机 / 内网 / 保留地址（SSRF 防护用）。
+
+    主判据是 ``not ip.is_global``：它一次覆盖 10/8、172.16/12、192.168/16、127/8、
+    169.254/16（云 metadata）、0.0.0.0/8、100.64/10（CGNAT，Tailscale 也用这段）
+    以及 IPv6 的回环/链路本地/唯一本地地址。后面几个显式判断只是兜住版本差异。
+    """
+
+    if not ip.is_global:
+        return True
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+    # ::ffff:127.0.0.1 这类 IPv4-mapped 地址要按 IPv4 再判一次
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        return ip_is_blocked(mapped)
+    return False
+
+
+def host_is_blocked(host: str) -> bool:
+    """按字面量判断主机名是否指向本机 / 内网（不做 DNS 解析）。
+
+    ``localhost``、``*.local``、``*.internal`` 这类名字，以及 ``127.0.0.1``、
+    ``10.0.0.1``、``169.254.169.254``（云 metadata）这类字面 IP 都会命中。
+    """
+
+    name = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not name:
+        return True
+    if name == "localhost" or name.endswith(BLOCKED_HOST_SUFFIXES):
+        return True
+    try:
+        return ip_is_blocked(ipaddress.ip_address(name))
+    except ValueError:
+        return False
+
+
+async def resolve_host_ips(host: str) -> list[str]:
+    """解析主机名到 IP 列表（用于抓取前的 SSRF 校验）。"""
+
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return sorted({str(info[4][0]) for info in infos})
+
+
+async def url_is_public(url: str) -> tuple[bool, str]:
+    """判断 URL 是否可以安全抓取，返回 ``(是否允许, 不允许的原因)``。
+
+    先看协议与字面主机名，再把域名解析成 IP 逐个检查：
+    只要有一个落在内网/本机/保留段就拒绝（防止 DNS 指向内网，也顺带挡住
+    ``http://2130706433/`` 这种十进制/八进制写法）。
+    """
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
+        return False, f"只允许 http/https，收到的是 {parsed.scheme or '(空)'}"
+    host = parsed.hostname or ""
+    if not host:
+        return False, "URL 里没有主机名"
+    if host_is_blocked(host):
+        return False, f"{host} 指向本机或内网地址"
+    try:
+        addresses = await resolve_host_ips(host)
+    except (OSError, asyncio.TimeoutError) as exc:
+        return False, f"{host} 域名解析失败：{exc}"
+    if not addresses:
+        return False, f"{host} 没有解析到任何地址"
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if ip_is_blocked(ip):
+            return False, f"{host} 解析到内网地址 {address}"
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # 状态存储
 # ---------------------------------------------------------------------------
@@ -1767,6 +1934,17 @@ class TwitterForwarderPlugin(MaiBotPlugin):
                     os.environ.get("PATH", ""),
                     float(self.config.media.inline_video_mb or 0),
                 )
+        if bool(self.config.link.enabled):
+            extractors = available_extractors()
+            self._get_logger().info(
+                "链接正文提取器：%s%s",
+                "/".join(extractors) if extractors else "无",
+                ""
+                if extractors
+                else "（trafilatura / bs4 / readability 都是可选增强，未安装时退化成正则清洗 + og:description）",
+            )
+            if not bool(self.config.link.allow_private_hosts):
+                self._get_logger().debug("已启用链接 SSRF 防护：指向本机/内网的链接会被丢弃")
 
     async def on_unload(self) -> None:
         """停止后台任务并落盘状态。"""
@@ -2497,17 +2675,35 @@ class TwitterForwarderPlugin(MaiBotPlugin):
 
     # -- 链接内容 ---------------------------------------------------------
 
+    async def _url_allowed(self, url: str) -> tuple[bool, str]:
+        """抓取前的 SSRF 校验；``link.allow_private_hosts`` 打开时一律放行。"""
+
+        if bool(self.config.link.allow_private_hosts):
+            return True, ""
+        return await url_is_public(url)
+
     async def _fetch_link_page(self, url: str, *, timeout: float, max_bytes: int) -> str:
-        """抓取链接页面：直连优先，连不上自动换代理重试一次。"""
+        """抓取链接页面：直连优先，连不上自动换代理重试一次。
+
+        推文里的链接是不可信输入，所以会先做 SSRF 校验，并在每次跳转时重新校验；
+        解析到本机/内网地址的链接直接丢弃（``link.allow_private_hosts`` 可放开）。
+        """
 
         client = self._client
         if client is None:
             return ""
+        allowed, reason = await self._url_allowed(url)
+        if not allowed:
+            self._get_logger().warning("链接内容跳过（SSRF 防护）: %s → %s", url, reason)
+            return ""
+
         explicit_proxy = str(self.config.link.proxy or "").strip()
         if explicit_proxy:
-            return await client.fetch_text(url, proxy=explicit_proxy, timeout=timeout, max_bytes=max_bytes)
+            return await client.fetch_text(
+                url, proxy=explicit_proxy, timeout=timeout, max_bytes=max_bytes, validate=self._url_allowed
+            )
 
-        page = await client.fetch_text(url, timeout=timeout, max_bytes=max_bytes)
+        page = await client.fetch_text(url, timeout=timeout, max_bytes=max_bytes, validate=self._url_allowed)
         if page:
             return page
 
@@ -2515,7 +2711,13 @@ class TwitterForwarderPlugin(MaiBotPlugin):
             fallback_proxy = str(self.config.twitter.proxy or "").strip()
             if fallback_proxy:
                 self._get_logger().debug("直连抓取不到内容，改用代理重试: %s", url)
-                page = await client.fetch_text(url, proxy=fallback_proxy, timeout=timeout, max_bytes=max_bytes)
+                page = await client.fetch_text(
+                    url,
+                    proxy=fallback_proxy,
+                    timeout=timeout,
+                    max_bytes=max_bytes,
+                    validate=self._url_allowed,
+                )
                 if page:
                     self._get_logger().info("代理抓取成功: %s", url)
         return page
@@ -3110,21 +3312,39 @@ class TwitterForwarderPlugin(MaiBotPlugin):
 
     # -- 命令辅助 ---------------------------------------------------------
 
-    def _is_allowed(self, kwargs: dict[str, Any]) -> bool:
-        """判断调用者是否有权使用命令。"""
+    #: 会看到/改到「别的聊天」或全局轮询状态的命令，默认只允许管理员与本地操作员
+    CROSS_CHAT_COMMANDS = frozenset({"all", "del", "reset", "check", "interval"})
 
-        if not bool(self.config.command.admin_only):
+    def _is_allowed(self, kwargs: dict[str, Any], *, cross_chat: bool = False) -> bool:
+        """判断调用者是否有权使用命令。
+
+        Args:
+            cross_chat: 该命令是否会影响全局订阅或轮询状态（如 ``/tw_del``、``/tw_interval``）。
+                这类命令默认（``command.cross_chat_admin_only``）只允许管理员与本地操作员，
+                避免群里的普通成员动到别的群。
+        """
+
+        command = self.config.command
+        need_admin = bool(command.admin_only)
+        if cross_chat and bool(getattr(command, "cross_chat_admin_only", True)):
+            need_admin = True
+        if not need_admin:
             return True
         if bool(kwargs.get("is_local_operator")):
             return True
         user_id = str(kwargs.get("user_id") or "").strip()
-        admins = {str(item).strip() for item in (self.config.command.admins or []) if str(item).strip()}
+        admins = {str(item).strip() for item in (command.admins or []) if str(item).strip()}
         return bool(user_id) and user_id in admins
 
     @staticmethod
-    def _deny_message() -> str:
+    def _deny_message(*, cross_chat: bool = False) -> str:
         """权限不足时的回复。"""
 
+        if cross_chat:
+            return (
+                "这条命令会影响所有聊天的订阅或全局轮询状态，默认只有管理员能用。"
+                "可以在插件配置的「命令」里把自己加进 admins，或把 cross_chat_admin_only 关掉。"
+            )
         return "你没有权限使用这个命令。可在插件配置的「命令」里把自己加进 admins，或把 admin_only 关掉。"
 
     async def _reply(self, stream_id: str, text: str) -> None:
@@ -3415,8 +3635,8 @@ class TwitterForwarderPlugin(MaiBotPlugin):
     async def handle_all(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /tw_all 命令。"""
 
-        if not self._is_allowed(kwargs):
-            await self._reply(stream_id, self._deny_message())
+        if not self._is_allowed(kwargs, cross_chat=True):
+            await self._reply(stream_id, self._deny_message(cross_chat=True))
             return False, "没有权限", True
 
         state = self._require_state()
@@ -3480,8 +3700,8 @@ class TwitterForwarderPlugin(MaiBotPlugin):
     async def handle_check(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /tw_check 命令。"""
 
-        if not self._is_allowed(kwargs):
-            await self._reply(stream_id, self._deny_message())
+        if not self._is_allowed(kwargs, cross_chat=True):
+            await self._reply(stream_id, self._deny_message(cross_chat=True))
             return False, "没有权限", True
 
         state = self._require_state()
@@ -3604,8 +3824,8 @@ class TwitterForwarderPlugin(MaiBotPlugin):
     async def handle_interval(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /tw_interval 命令。"""
 
-        if not self._is_allowed(kwargs):
-            await self._reply(stream_id, self._deny_message())
+        if not self._is_allowed(kwargs, cross_chat=True):
+            await self._reply(stream_id, self._deny_message(cross_chat=True))
             return False, "没有权限", True
 
         state = self._require_state()
@@ -3648,8 +3868,8 @@ class TwitterForwarderPlugin(MaiBotPlugin):
     async def handle_reset(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /tw_reset 命令。"""
 
-        if not self._is_allowed(kwargs):
-            await self._reply(stream_id, self._deny_message())
+        if not self._is_allowed(kwargs, cross_chat=True):
+            await self._reply(stream_id, self._deny_message(cross_chat=True))
             return False, "没有权限", True
 
         handles, problems = await self._resolve_handles(
@@ -3686,8 +3906,8 @@ class TwitterForwarderPlugin(MaiBotPlugin):
     async def handle_del(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, bool]:
         """处理 /tw_del 命令。"""
 
-        if not self._is_allowed(kwargs):
-            await self._reply(stream_id, self._deny_message())
+        if not self._is_allowed(kwargs, cross_chat=True):
+            await self._reply(stream_id, self._deny_message(cross_chat=True))
             return False, "没有权限", True
 
         handles, problems = await self._resolve_handles(

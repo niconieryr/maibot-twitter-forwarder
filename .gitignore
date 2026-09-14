@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# 实例文件：由 Runner 按 config_model 生成、WebUI/聊天命令维护，不进仓库
+config.toml
+state.json
+data/
+
 # 自测脚本产生的临时数据
 tests/data/
 tests/_preview-data/

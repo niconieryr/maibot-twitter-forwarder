@@ -224,7 +224,15 @@ class StubClient:
         proxy: str | None = None,
         timeout: float = 25.0,
         max_bytes: int = 0,
+        validate=None,
+        max_redirects: int = 5,
     ):
+        # 替身不模拟真实网络，但仍然尊重 SSRF 校验：校验不通过就当抓不到
+        if validate is not None:
+            allowed, _reason = await validate(url)
+            if not allowed:
+                self.fetched_pages.append((url, proxy))
+                return ""
         self.fetched_pages.append((url, proxy))
         if proxy:
             return self.proxy_pages.get(url, "")
@@ -395,6 +403,48 @@ def test_pure_functions(module) -> None:
         video_tweet.image_sources() == ["https://pbs.twimg.com/thumb.jpg"],
         "视频推文的封面仍可作回退图",
     )
+
+
+def test_url_safety(module) -> None:
+    """外链安全（SSRF 防护）与默认安全值。"""
+
+    print("\n[1b] 外链安全 / 默认安全值")
+    blocked = [
+        "localhost",
+        "127.0.0.1",
+        "127.1.2.3",
+        "0.0.0.0",
+        "10.0.0.5",
+        "172.16.9.9",
+        "192.168.1.104",
+        "169.254.169.254",  # 云 metadata
+        "::1",
+        "fe80::1",
+        "fd00::1",
+        "::ffff:127.0.0.1",
+        "foo.local",
+        "router.localdomain",
+        "metadata.google.internal",
+        "redis.internal",
+        "",
+    ]
+    for host in blocked:
+        check(module.host_is_blocked(host), f"内网/本机主机名被拦截：{host or '(空)'}")
+
+    for host in ["example.com", "pbs.twimg.com", "8.8.8.8", "2606:4700::1111"]:
+        check(not module.host_is_blocked(host), f"公网主机名放行：{host}")
+
+    check(module.ip_is_blocked(module.ipaddress.ip_address("100.64.0.1")), "运营商级 NAT 段也拦（100.64/10）")
+    check(module.ip_is_blocked(module.ipaddress.ip_address("169.254.169.254")), "metadata 地址判定为危险")
+    check(not module.ip_is_blocked(module.ipaddress.ip_address("1.1.1.1")), "公网 IP 判定为安全")
+
+    # 默认安全值
+    plugin = module.create_plugin()
+    defaults = plugin.get_default_config()
+    check(defaults["command"]["cross_chat_admin_only"] is True, "跨聊天命令默认仅管理员可用")
+    check(defaults["command"]["admin_only"] is False, "聊天内命令默认不限管理员")
+    check(defaults["push"]["skip_sensitive"] is True, "默认跳过敏感推文")
+    check(defaults["link"]["allow_private_hosts"] is False, "默认禁止抓取内网链接")
 
 
 def test_components(module) -> None:
@@ -1536,6 +1586,9 @@ async def test_commands(module, plugin, context) -> None:
 
     print("\n[6] 命令回复")
     state = plugin._require_state()
+    # 10001 当作管理员：跨聊天命令（/tw_all /tw_del /tw_reset /tw_check /tw_interval）
+    # 现在默认只允许管理员与本地操作员，下面的用例都用它来调用
+    plugin.config.command.admins = ["10001"]
 
     context.send.reset()
     await plugin.handle_list(stream_id="stream-a", user_id="10001")
@@ -1599,6 +1652,56 @@ async def test_commands(module, plugin, context) -> None:
     check(allowed[0] is True, "管理员放行")
     plugin.config.command.admin_only = False
 
+    # 跨聊天命令默认收紧：普通成员不能看/改全局订阅与轮询状态
+    plugin.config.command.cross_chat_admin_only = True
+    plugin.config.command.admins = ["10001"]
+    context.send.reset()
+    blocked_all = await plugin.handle_all(stream_id="stream-a", user_id="99999")
+    check(blocked_all[0] is False, "普通成员不能用 /tw_all")
+    check("影响所有聊天" in context.send.last_text(), f"/tw_all 的拒绝理由说清影响面：{context.send.last_text().strip()}")
+    context.send.reset()
+    blocked_interval = await plugin.handle_interval(
+        stream_id="stream-a", matched_groups={"value": "5"}, user_id="99999"
+    )
+    check(blocked_interval[0] is False, "普通成员不能用 /tw_interval")
+    check(plugin._effective_interval_minutes() == 10, "被拒绝的 /tw_interval 没有真的改掉间隔")
+    context.send.reset()
+    blocked_del = await plugin.handle_del(stream_id="stream-a", matched_groups={"handles": "elonmusk"}, user_id="99999")
+    check(blocked_del[0] is False, "普通成员不能用 /tw_del")
+    check("elonmusk" in plugin._require_state().handles, "被拒绝的 /tw_del 没有真的删掉订阅")
+    context.send.reset()
+    blocked_reset = await plugin.handle_reset(
+        stream_id="stream-a", matched_groups={"handles": "elonmusk"}, user_id="99999"
+    )
+    check(blocked_reset[0] is False, "普通成员不能用 /tw_reset")
+    context.send.reset()
+    blocked_check = await plugin.handle_check(stream_id="stream-a", user_id="99999")
+    check(blocked_check[0] is False, "普通成员不能用 /tw_check")
+
+    # 聊天内命令对普通成员保持可用
+    context.send.reset()
+    local_list = await plugin.handle_list(stream_id="stream-a", user_id="99999")
+    check(local_list[0] is True, "普通成员仍能用聊天内的 /tw_list")
+    context.send.reset()
+    local_sub = await plugin.handle_sub(stream_id="stream-a", matched_groups={"handles": "jack"}, user_id="99999")
+    check(local_sub[0] is True, "普通成员仍能订阅自己所在的聊天")
+    plugin._require_state().handles.pop("jack", None)
+
+    # 本地操作员始终放行；管理员同样放行
+    context.send.reset()
+    operator_ok = await plugin.handle_all(stream_id="stream-a", user_id="", is_local_operator=True)
+    check(operator_ok[0] is True, "本地操作员可以用跨聊天命令")
+    context.send.reset()
+    admin_ok = await plugin.handle_all(stream_id="stream-a", user_id="10001")
+    check(admin_ok[0] is True, "admins 里的管理员可以用跨聊天命令")
+
+    # 显式关掉收紧开关后，普通成员又能用（老行为）
+    plugin.config.command.cross_chat_admin_only = False
+    context.send.reset()
+    reopened = await plugin.handle_all(stream_id="stream-a", user_id="99999")
+    check(reopened[0] is True, "关掉 cross_chat_admin_only 后普通成员可用")
+    plugin.config.command.cross_chat_admin_only = True
+
     context.send.reset()
     await plugin.handle_del(stream_id="stream-a", matched_groups={"handles": "elonmuskk"}, user_id="10001")
     typo_reply = context.send.last_text()
@@ -1610,11 +1713,72 @@ async def test_commands(module, plugin, context) -> None:
     check("elonmusk" not in plugin._require_state().handles, "订阅确实被删除")
 
 
+def make_internal_link_tweet(module):
+    """构造一条正文里带内网链接的推文（模拟恶意推文）。"""
+
+    return module.Tweet(
+        id="999001",
+        url="https://x.com/a/status/999001",
+        text="看这个 http://127.0.0.1:8080/secret 和 http://169.254.169.254/latest/meta-data/",
+        created_ts=time.time(),
+        author_name="A",
+        author_screen_name="a",
+    )
+
+
+async def test_url_safety_async(module, plugin, context) -> None:
+    """SSRF 校验：URL 级判定 + 插件层开关 + 抓取前拦截。"""
+
+    print("\n[7] 外链 SSRF 防护")
+
+    async def expect_blocked(url: str, label: str) -> None:
+        allowed, reason = await module.url_is_public(url)
+        check(not allowed, f"{label} 被拦截：{url}（{reason}）")
+
+    await expect_blocked("http://127.0.0.1:7890/", "本机回环")
+    await expect_blocked("http://localhost/admin", "localhost")
+    await expect_blocked("http://192.168.1.1/", "内网段")
+    await expect_blocked("http://169.254.169.254/latest/meta-data/", "云 metadata")
+    await expect_blocked("http://[::1]/", "IPv6 回环")
+    await expect_blocked("file:///etc/passwd", "非 http(s) 协议")
+    await expect_blocked("http://2130706433/", "十进制写法的 127.0.0.1")
+    await expect_blocked("http://metadata.google.internal/computeMetadata/v1/", "云厂商内网域名")
+    await expect_blocked("", "空 URL")
+
+    allowed, reason = await module.url_is_public("https://example.com/")
+    check(allowed, f"公网链接放行：{reason}")
+
+    # 插件层：开关打开时不再拦截
+    check(plugin.config.link.allow_private_hosts is False, "默认不开私网抓取")
+    ok, _ = await plugin._url_allowed("http://127.0.0.1:7890/")
+    check(not ok, "插件默认拦截内网链接")
+    plugin.config.link.allow_private_hosts = True
+    ok, _ = await plugin._url_allowed("http://127.0.0.1:7890/")
+    check(ok, "allow_private_hosts 打开后放行")
+    plugin.config.link.allow_private_hosts = False
+
+    # 抓取前拦截：校验不通过时不应该发出请求，返回空串
+    client = plugin._client
+    check(client is not None, "测试用客户端已就绪")
+    if client is not None:
+        page = await client.fetch_text(
+            "http://127.0.0.1:7890/", timeout=5, max_bytes=4096, validate=plugin._url_allowed
+        )
+        check(page == "", "校验不通过时 fetch_text 直接返回空串")
+
+    # 链接预览整条链路：内网链接不会产生链接内容块
+    tweet = make_internal_link_tweet(module)
+    await plugin._attach_link_previews([tweet])
+    check(not tweet.link_preview, "内网链接不会抓取成链接内容")
+    check(not tweet.expanded_links, "内网链接不会被标记成已展开")
+
+
 async def main() -> int:
     """执行全部测试。"""
 
     module = load_plugin_module()
     test_pure_functions(module)
+    test_url_safety(module)
     test_components(module)
 
     if STATE_PATH.exists():
@@ -1637,6 +1801,7 @@ async def main() -> int:
         await test_batch_forward(module, plugin, context)
         await test_translation(module, plugin, context)
         await test_link_preview(module, plugin, context)
+        await test_url_safety_async(module, plugin, context)
         await test_commands(module, plugin, context)
     finally:
         await plugin.on_unload()
