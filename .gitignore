@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 自测脚本产生的临时数据
+tests/data/
+tests/_preview-data/
+tests/-*-tmpcopy.mp4
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

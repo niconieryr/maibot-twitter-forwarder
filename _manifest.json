@@ -1,0 +1,51 @@
+{
+  "manifest_version": 2,
+  "id": "polarbear.twitter-forwarder",
+  "version": "1.6.2",
+  "name": "推特转发 / Twitter Forwarder",
+  "description": "用 FxTwitter 轮询订阅推主的最新推文（默认 10 分钟一次），有新推就转发到群里：正文、配图、视频本体、自动翻译、链接正文一条龙；提供 /tw_sub 等斜杠命令，订阅、退订、间隔、暂停都能在聊天里直接改。",
+  "author": {
+    "name": "polarbear",
+    "url": "https://github.com/niconieryr"
+  },
+  "license": "GPL-3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/niconieryr/maibot-twitter-forwarder",
+    "homepage": "https://github.com/niconieryr/maibot-twitter-forwarder",
+    "documentation": "https://github.com/niconieryr/maibot-twitter-forwarder/blob/main/README.md",
+    "issues": "https://github.com/niconieryr/maibot-twitter-forwarder/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.2.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "integration",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "bird",
+      "fallback": "send",
+      "background": "#1d9bf0"
+    }
+  },
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "send.forward",
+    "send.hybrid",
+    "chat.get_all_streams",
+    "llm.generate"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "changelog": "CHANGELOG.md"
+}

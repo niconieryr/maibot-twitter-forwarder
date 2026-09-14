@@ -1,0 +1,218 @@
+# 推特转发插件配置
+# 这份文件是"基线配置"，WebUI 插件配置页改的也是它。
+# 聊天里的 /tw_interval 等命令产生的改动保存在 data/plugins/polarbear.twitter-forwarder/state.json，
+# 属于运行时覆盖，优先级高于这里的值。
+
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[poll]
+# 轮询间隔（分钟）。聊天里可用 /tw_interval 临时覆盖。
+interval_minutes = 10
+
+# 插件加载后首次轮询的延迟（秒），避免和机器人启动抢网络。
+initial_delay_seconds = 30
+
+# 单次 HTTP 请求超时（秒）。
+request_timeout_seconds = 20
+
+# 单次请求失败后的重试次数。
+retry_times = 2
+
+# 每个推主每轮拉取的条目数（1-50）。
+fetch_count = 20
+
+# 每个推主每轮最多推送几条新推文，剩下的留到下一轮。
+max_tweets_per_poll = 3
+
+# 同时轮询的推主数量上限。
+max_concurrency = 3
+
+[twitter]
+# FxTwitter API，国内可直连，一般不用改。
+api_base = "https://api.fxtwitter.com"
+
+# FxTwitter 站点地址，v2 接口失败时用它拉 Atom feed 兜底。
+feed_base = "https://fxtwitter.com"
+enable_feed_fallback = true
+
+# 下载配图用的 HTTP 代理。
+# pbs.twimg.com（推文图片）国内直连不通，必须走代理，否则推文只有文字没有图。
+# 本机 Clash 默认监听 127.0.0.1:7890；不需要代理时留空字符串。
+proxy = "http://127.0.0.1:7890"
+
+# 调用 fxtwitter 接口时是否也走代理（接口本身可直连，默认关闭）。
+use_proxy_for_api = false
+
+# 请求使用的 User-Agent。
+user_agent = "MaiBot-TwitterForwarder/1.0 (+https://github.com/MaiM-with-u/maibot)"
+
+[push]
+# 额外固定推送目标：填聊天流 session_id，所有订阅都会同步推到这些流。
+extra_streams = []
+
+# 是否推送转推（博主转发别人的推文）。
+include_reposts = true
+
+# 是否推送回复（博主回复别人）。
+include_replies = false
+
+# 新增订阅时立刻把该推主最新一条推过来，方便确认配置是否生效。
+push_latest_on_subscribe = true
+
+# 是否跳过被标记为可能敏感的推文。
+skip_sensitive = false
+
+[media]
+download_images = true
+
+# 单条推文最多发送几张图。
+max_images = 4
+
+# 图片尺寸：orig / large / medium / small。
+# medium 约 1200px，体积和清晰度比较平衡。
+image_quality = "medium"
+
+# 单张图片大小上限（MB），超过就跳过这张。
+max_image_mb = 3.0
+
+# 单条推文图片总大小上限（MB），避免一次性发太多图。
+max_total_mb = 6.0
+
+# 单张图片下载超时（秒）。
+media_timeout_seconds = 30
+
+# 视频处理：
+#   auto      = 尽量把原视频下载下来直接发（推荐）
+#   thumbnail = 只发视频封面 + 原推链接
+#   link      = 只发原推链接
+video_mode = "auto"
+
+# 以内联 base64 发送的视频大小上限（MB）。
+# 受 MaiBot 插件 IPC 单帧 16MB 限制，实测安全上限约 11MB，别调太高。
+inline_video_mb = 10.0
+
+# 视频下载大小上限（MB），超过这个大小就只发封面 + 链接。
+max_video_mb = 300.0
+
+# 视频下载超时（秒）。大视频下载慢，别调太小。
+video_timeout_seconds = 180
+
+# 大于 inline_video_mb 的视频：下载到本地后，用 docker 拷进 SnowLuma 容器，
+# 再以容器内路径发送（需要运行 MaiBot 的用户能执行 docker 命令）。
+big_video_docker_route = true
+
+# 大视频路由的目标容器名（docker ps 里的 NAMES）。
+docker_container = "snowluma"
+
+# 发完之后容器内那个视频文件再保留多少秒才删（0 = 立刻删）。
+# NapCat 传大视频可能在 send 返回后还在读这个文件，删太早 QQ 那边会收不到，
+# 所以默认留 3 分钟；本地临时文件始终是发完就删。
+video_keep_seconds = 180
+
+[display]
+# true=图文打包成一条合并转发；false=先发文字再逐张发图。
+use_forward = true
+
+# 一次有多个新推文时，合并成一条聊天记录（合并转发），每条推文占其中一个节点。
+# 例如一轮轮询到 3 条新推文，就发一条聊天记录、里面 3 个节点。
+batch_forward = true
+
+# 单条聊天记录里图片的总大小上限（MB），超过会自动拆成多条聊天记录，
+# 避免一次塞太多图撞上插件 IPC 的单帧 16MB 限制。
+batch_max_mb = 7.0
+
+# 视频是否也放进这条聊天记录。
+# QQ 协议要求「video 必须是消息里唯一的元素」，所以视频推文会占两个相邻节点：
+# 正文节点 + 只有视频的节点。关掉则视频改成单独成条发送。
+video_in_forward = true
+
+# 合并转发节点里显示的昵称前缀，最终形如「推特转发 · Elon Musk」。
+forward_nickname = "推特转发"
+
+show_author = true
+
+# 作者行下面的分隔线；留空表示不画
+header_divider = "────────────────"
+
+# 已经抓出正文的链接，从推文正文里去掉，避免和下面的链接内容重复
+hide_expanded_url = true
+
+show_link = true
+show_stats = true
+
+# 正文最大字符数，0 表示不截断。
+max_text_chars = 600
+
+[translation]
+# 是否自动翻译推文正文（译文直接替换原文，不保留原语言正文）
+enabled = true
+
+# 用哪个模型任务做翻译。replyer = 回复模型（默认）；
+# 也可以换成 utils（小任务模型，更快更省）等 model_config.toml 里的任务名。
+model_task = "replyer"
+
+# 翻译目标语言
+target_lang = "简体中文"
+
+# 是否一并翻译「引用」的推文
+translate_quote = true
+
+# 推文本身就是目标语言时跳过翻译（优先看接口给的 lang，没有就按字符比例兜底）
+skip_if_target_lang = true
+
+# 超过这个长度的推文不翻译（省 token），0 表示不限制
+max_chars = 1200
+
+# 同时翻译的条数上限
+max_concurrency = 3
+
+# 单条翻译超时（秒）
+timeout_seconds = 45
+
+# 翻译提示词，{target_lang} 会被替换成目标语言
+prompt = """你是专业的推文翻译助手。把用户给出的推文翻译成{target_lang}。
+要求：
+1. 只输出译文，不要输出原文、不要解释、不要加任何前缀或标记；
+2. 保留原文的换行、语气和 emoji；
+3. 人名、产品名、账号名、话题标签保持原文；
+4. 如果原文已经是{target_lang}，原样输出。"""
+
+[link]
+# 是否把推文里链接的正文也抓出来，一起放进这条推文里
+enabled = true
+
+# 每条推文最多展开几个链接
+max_links = 1
+
+# 抓到的正文最多保留多少字（0 表示不限制）；超长会尽量切在段落处
+max_chars = 3000
+
+# 长正文分段翻译时每段的字符数：太小会丢上下文，太大可能撞上模型输出上限被截断
+translate_chunk_chars = 1200
+
+# 单次抓取超时（秒）；直连失败会用下面的代理再试一次
+timeout_seconds = 15
+
+# 页面下载大小上限（MB）
+max_page_mb = 2.0
+
+# 抓取用的代理；留空表示先直连（失败会自动用 [twitter] 的代理重试）
+proxy = ""
+
+# 直连抓不到时，用 [twitter] 的代理再试一次
+fallback_proxy = true
+
+# 抓到的正文是否也翻译（复用 [translation] 的目标语言；已经是目标语言会自动跳过）
+translate = true
+
+# Steam 新闻支持带语言参数，优先取哪种语言（schinese/english/japanese/koreana…）
+link_language = "schinese"
+
+[command]
+# true 时只有 admins 里的 QQ 号（以及机器人的本地操作员）能使用这些命令。
+admin_only = false
+
+# 管理员 QQ 号列表，例如 ["123456789"]。
+admins = []
